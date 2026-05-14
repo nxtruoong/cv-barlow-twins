@@ -46,7 +46,7 @@ def predict_with_tta(
                 tf(Image.open(p).convert("RGB")) for p in batch_paths
             ]).to(device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=amp):
+            with torch.amp.autocast("cuda", enabled=amp):
                 logits = model(imgs)
                 probs = F.softmax(logits.float(), dim=1)
             all_probs[start:start + len(batch_paths)] += probs.cpu().numpy()

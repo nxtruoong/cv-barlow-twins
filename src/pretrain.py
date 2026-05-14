@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from timm.scheduler import CosineLRScheduler
@@ -124,7 +124,7 @@ def run_pretrain(args) -> None:
         optimizer, t_initial=args.epochs, warmup_t=PRETRAIN_WARMUP_EPOCHS,
         warmup_lr_init=1e-6, lr_min=0.0,
     )
-    scaler = GradScaler(enabled=args.amp)
+    scaler = GradScaler("cuda", enabled=args.amp)
 
     start_epoch = 0
     history = []
@@ -155,9 +155,13 @@ def run_pretrain(args) -> None:
             v1 = v1.to(device, non_blocking=True)
             v2 = v2.to(device, non_blocking=True)
 
-            with autocast(enabled=args.amp):
-                z1 = model(v1)
-                z2 = model(v2)
+            # Concat views into single forward pass. Two separate forwards
+            # through a DDP-wrapped model corrupts autograd version counters
+            # ("variable modified by inplace op" error). Also faster.
+            with autocast("cuda", enabled=args.amp):
+                v = torch.cat([v1, v2], dim=0)
+                z = model(v)
+                z1, z2 = z.chunk(2, dim=0)
                 loss = loss_fn(z1, z2)
 
             optimizer.zero_grad(set_to_none=True)

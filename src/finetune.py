@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm
 
@@ -60,7 +60,7 @@ def train_one_epoch(model, loader, optim, loss_fn, scaler, device, amp: bool) ->
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        with autocast(enabled=amp):
+        with autocast("cuda", enabled=amp):
             logits = model(x)
             loss = loss_fn(logits, y)
         optim.zero_grad(set_to_none=True)
@@ -98,7 +98,7 @@ def run_finetune(args) -> dict:
 
     model = build_classifier_for_condition(args.condition, args.simclr_ckpt).to(device)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=FINETUNE_LABEL_SMOOTHING)
-    scaler = GradScaler(enabled=args.amp)
+    scaler = GradScaler("cuda", enabled=args.amp)
 
     # ---- Stage 1: freeze backbone, train classifier ----
     freeze_backbone(model)
