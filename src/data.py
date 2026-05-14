@@ -9,7 +9,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupKFold
 
-from .config import SEED, N_FOLDS, PRETRAIN_IMG_SIZE, get_data_root
+from .config import (
+    SEED, N_FOLDS, PRETRAIN_IMG_SIZE, PRETRAIN_CACHE_RES,
+    PRETRAIN_CACHE_PATH, PRETRAIN_CACHE_INDEX, get_data_root,
+)
 from .seed_utils import make_generator, worker_init_fn
 
 
@@ -72,6 +75,43 @@ class UnlabeledImageDataset(Dataset):
         # 2x draft target: RandomResizedCrop scale_min=0.5 -> need 2x crop size
         img = _fast_jpeg_open(self.paths[idx], PRETRAIN_IMG_SIZE * 2)
         return self.view_generator(img)
+
+
+class MemmapUnlabeledDataset(Dataset):
+    """SimCLR pretrain from a pre-decoded uint8 memmap of shape (N, R, R, 3).
+
+    Eliminates JPEG decode from the hot loop. Slice -> torch tensor HWC uint8
+    -> permute to CHW -> hand to tensor-space v2 transforms. The transform is
+    expected to handle dtype conversion and normalization.
+    """
+
+    def __init__(
+        self,
+        memmap_path: str = PRETRAIN_CACHE_PATH,
+        index_path: str = PRETRAIN_CACHE_INDEX,
+        view_generator: Optional[Callable] = None,
+        cache_res: int = PRETRAIN_CACHE_RES,
+    ):
+        import json
+        with open(index_path) as f:
+            meta = json.load(f)
+        self.n = int(meta["n"])
+        self.res = int(meta.get("res", cache_res))
+        self.mm = np.memmap(
+            memmap_path, dtype=np.uint8, mode="r",
+            shape=(self.n, self.res, self.res, 3),
+        )
+        self.view_generator = view_generator
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int):
+        arr = np.array(self.mm[idx], copy=True)  # copy decouples worker from mmap
+        t = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW uint8
+        if self.view_generator is None:
+            return t
+        return self.view_generator(t)
 
 
 class LabeledImageDataset(Dataset):
