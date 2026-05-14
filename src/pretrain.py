@@ -125,9 +125,11 @@ def run_pretrain(args) -> None:
     model = SimCLRModel(pretrained_backbone=False).to(device)
     model = model.to(memory_format=torch.channels_last)
     if not args.no_compile:
-        # torch.compile BEFORE DDP wrap. mode="max-autotune" tunes kernels for
-        # the fixed (B, C, H, W) shape — drop_last=True keeps shape stable.
-        model = torch.compile(model, mode="max-autotune")
+        # torch.compile BEFORE DDP wrap. mode="reduce-overhead" enables CUDA
+        # graphs (skip kernel-launch overhead) — best fit for T4 (40 SMs, below
+        # the 68-SM threshold for max_autotune_gemm). drop_last=True keeps
+        # shape stable so graphs don't recapture.
+        model = torch.compile(model, mode="reduce-overhead")
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=False)

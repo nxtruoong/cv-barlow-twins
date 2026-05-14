@@ -45,7 +45,7 @@ def make_args(resume=None):
         epochs=PRETRAIN_EPOCHS,
         batch_size=PRETRAIN_BATCH_SIZE,
         lr=PRETRAIN_LR,
-        num_workers=8,
+        num_workers=2,  # per-rank; DDP world=2 -> 4 total, matches Kaggle 4-CPU env
         amp=True,
         no_compile=False,
         save_every=10,
