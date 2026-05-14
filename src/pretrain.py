@@ -30,6 +30,13 @@ from .model import SimCLRModel
 from .seed_utils import set_seed
 
 
+def _unwrap(m: nn.Module) -> nn.Module:
+    """Strip DDP and torch.compile wrappers to access underlying module."""
+    m = getattr(m, "module", m)  # DDP
+    m = getattr(m, "_orig_mod", m)  # torch.compile
+    return m
+
+
 def setup_distributed() -> tuple:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -52,7 +59,7 @@ def save_checkpoint(model: nn.Module, optimizer, scheduler, epoch: int,
     out_dir.mkdir(parents=True, exist_ok=True)
     state = {
         "epoch": epoch,
-        "model_state_dict": (model.module if hasattr(model, "module") else model).state_dict(),
+        "model_state_dict": _unwrap(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "history": history,
@@ -117,6 +124,10 @@ def run_pretrain(args) -> None:
 
     model = SimCLRModel(pretrained_backbone=False).to(device)
     model = model.to(memory_format=torch.channels_last)
+    if not args.no_compile:
+        # torch.compile BEFORE DDP wrap. mode="max-autotune" tunes kernels for
+        # the fixed (B, C, H, W) shape — drop_last=True keeps shape stable.
+        model = torch.compile(model, mode="max-autotune")
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=False)
@@ -136,8 +147,7 @@ def run_pretrain(args) -> None:
     history = []
     if args.resume and Path(args.resume).exists():
         ckpt = torch.load(args.resume, map_location="cpu")
-        target = model.module if hasattr(model, "module") else model
-        target.load_state_dict(ckpt["model_state_dict"])
+        _unwrap(model).load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if ckpt.get("scheduler_state_dict"):
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -156,16 +166,18 @@ def run_pretrain(args) -> None:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
-        running = 0.0
+        # Async loss accumulator (stays on GPU until epoch end -> no per-step sync)
+        loss_accum = torch.zeros((), device=device)
+        # Diagnostics sampled every DIAG_EVERY steps; ~5% sync overhead
+        DIAG_EVERY = 20
         n_batches = 0
+        diag_count = 0
         t_data_sum = 0.0
         t_compute_sum = 0.0
         pos_sum = 0.0
         neg_sum = 0.0
         std_sum = 0.0
-        grad_sum = 0.0
         images_seen = 0
-        amp_verified = False
         epoch_t0 = time.time()
         pbar = tqdm(loader, disable=not is_main(rank), desc=f"epoch {epoch}")
         t_iter = time.time()
@@ -183,58 +195,40 @@ def run_pretrain(args) -> None:
                 z1, z2 = z.chunk(2, dim=0)
                 loss = loss_fn(z1, z2)
 
-            if not amp_verified and is_main(rank):
-                # AMP verify via inline backbone probe (under autocast).
-                # Model's final op is F.normalize which promotes to fp32 by
-                # autocast policy — that's expected. Check backbone interior.
-                base = model.module if hasattr(model, "module") else model
-                with torch.no_grad(), autocast("cuda", enabled=args.amp):
-                    probe_h = base.backbone(v[:2])
-                print(f"[amp check] backbone_dtype={probe_h.dtype} "
-                      f"normalized_z_dtype={z.dtype} "
-                      f"(fp16 backbone + fp32 normalize = AMP working)")
-                amp_verified = True
-
-            # Collapse / quality stats. z already L2-normalized by SimCLRModel.
-            with torch.no_grad():
-                pos_sim = (z1 * z2).sum(dim=1).mean().item()
-                B = z1.size(0)
-                sim_mat = z1 @ z2.t()  # (B, B); diagonal = positives
-                neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
-                neg_sim = sim_mat[neg_mask].mean().item()
-                embed_std = torch.cat([z1, z2], dim=0).std(dim=0).mean().item()
-
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=float("inf")
-            ).item()
             scaler.step(optimizer)
             scaler.update()
 
-            # No per-step cuda.synchronize: kills kernel-launch overlap.
-            # t_compute is kernel-queue time (approximate). Wallclock
-            # throughput at epoch end uses one final sync and is accurate.
+            # GPU-side accumulation. No .item() in hot loop -> no CPU<->GPU sync,
+            # async kernel queue stays full.
+            loss_accum += loss.detach()
+            n_batches += 1
+            images_seen += v.size(0)
             t_compute = time.time() - t_iter - t_data
             t_data_sum += t_data
             t_compute_sum += t_compute
 
-            running += loss.item()
-            pos_sum += pos_sim
-            neg_sum += neg_sim
-            std_sum += embed_std
-            grad_sum += grad_norm
-            n_batches += 1
-            images_seen += v.size(0)
-            if is_main(rank):
-                pbar.set_postfix(
-                    loss=running / n_batches,
-                    pos=pos_sum / n_batches,
-                    neg=neg_sum / n_batches,
-                    std=std_sum / n_batches,
-                    gn=grad_sum / n_batches,
-                )
+            # Sampled diagnostics: one sync per DIAG_EVERY steps.
+            if n_batches % DIAG_EVERY == 0:
+                with torch.no_grad():
+                    pos_t = (z1 * z2).sum(dim=1).mean()
+                    B = z1.size(0)
+                    sim_mat = z1 @ z2.t()
+                    neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
+                    neg_t = sim_mat[neg_mask].mean()
+                    std_t = torch.cat([z1, z2], dim=0).std(dim=0).mean()
+                pos_sum += pos_t.item()
+                neg_sum += neg_t.item()
+                std_sum += std_t.item()
+                diag_count += 1
+                if is_main(rank):
+                    pbar.set_postfix(
+                        loss=(loss_accum / n_batches).item(),
+                        pos=pos_sum / diag_count,
+                        neg=neg_sum / diag_count,
+                        std=std_sum / diag_count,
+                    )
             t_iter = time.time()
 
         if device.type == "cuda":
@@ -254,14 +248,13 @@ def run_pretrain(args) -> None:
                   f"| {throughput:.0f} img/s | {epoch_sec/60:.1f} min "
                   f"| peak_mem={gpu_mem_peak_gb:.2f} GB | lr={current_lr:.2e}")
 
-        epoch_loss = running / max(n_batches, 1)
+        epoch_loss = (loss_accum / max(n_batches, 1)).item()
         log_entry = {
             "epoch": epoch,
             "loss": epoch_loss,
-            "pos_sim": pos_sum / max(n_batches, 1),
-            "neg_sim": neg_sum / max(n_batches, 1),
-            "embed_std": std_sum / max(n_batches, 1),
-            "grad_norm": grad_sum / max(n_batches, 1),
+            "pos_sim": pos_sum / max(diag_count, 1),
+            "neg_sim": neg_sum / max(diag_count, 1),
+            "embed_std": std_sum / max(diag_count, 1),
             "lr": current_lr,
             "throughput_img_s": throughput,
             "epoch_sec": epoch_sec,
@@ -271,7 +264,7 @@ def run_pretrain(args) -> None:
         }
 
         if is_main(rank) and (epoch + 1) % args.diagnostic_every == 0:
-            base = model.module if hasattr(model, "module") else model
+            base = _unwrap(model)
             base.eval()
             au = sample_alignment_uniformity(base, loader, device, max_batches=3)
             probe_train, probe_val = build_probe_loaders(
@@ -317,6 +310,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=PRETRAIN_LR)
     p.add_argument("--num-workers", type=int, default=12)
     p.add_argument("--amp", action="store_true", default=True)
+    p.add_argument("--no-compile", action="store_true", default=False,
+                   help="disable torch.compile (debug only)")
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--diagnostic-every", type=int, default=10)
     p.add_argument("--resume", type=str, default=None)

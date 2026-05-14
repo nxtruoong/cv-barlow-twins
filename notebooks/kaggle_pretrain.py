@@ -1,22 +1,18 @@
-"""Day 2-4: SimCLR pretraining on Kaggle T4 x2.
+"""SimCLR pretraining on Kaggle T4 x2.
 
 Paste this into a Kaggle notebook with Accelerator = GPU T4 x2.
 
 Strategy:
-- Use DDP via torch.multiprocessing.spawn (notebook-friendly alternative to torchrun).
-- 200 epochs total. Save every 10. Diagnostic every 10 (linear probe + align/uniform).
-- Pretrain at 160x160 (PRETRAIN_IMG_SIZE) for ~2x FLOP cut vs 224. Phase 2
-  fine-tune upscales back to 224 (FixRes). Each session ~5h fits more epochs
-  than at 224.
-- Batch 256 at 160 uses ~6-7GB VRAM — room to bump to 384-512 if desired.
-- Resume from previous checkpoint by setting RESUME below.
+- DDP via torch.multiprocessing.spawn (notebook-friendly alternative to torchrun).
+- 100 epochs total, batch 768, LR sqrt-scaled, rect 160x120 (W x H).
+- torch.compile(max-autotune) + FP16 AMP + channels_last. First epoch slower
+  due to one-time autotune (1-3 min); steady-state ~3-4 min/epoch.
+- Target: <10h wallclock single session. No multi-day resume needed.
+- Save every 10. Diagnostic every 10 (linear probe + align/uniform).
+- Resume from previous checkpoint by setting RESUME below (optional).
 
-Day 2: session 1, epochs 0-80
-Day 3: resume from ep080 ckpt, run to ep160
-Day 4 AM: resume from ep160 ckpt, run to ep200 (~3h), then fine-tune
-
-After session ends, download `simclr_resnet18_latest.pth` and upload it as a
-Kaggle Dataset so next session can attach it as input.
+After session ends, download `simclr_resnet18_latest.pth` and upload as a
+Kaggle Dataset so fine-tune notebook can attach it as input.
 
 NOTE: ddp_worker MUST be defined in src.pretrain (importable module), not in this
 notebook script. torch.multiprocessing.spawn pickles by qualified name and child
@@ -37,20 +33,22 @@ import torch
 import torch.multiprocessing as mp
 
 from src.pretrain import run_pretrain, ddp_worker
+from src.config import PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_LR
 
 
 # Set RESUME to checkpoint path from previous session (or None for fresh start)
-RESUME = None  # e.g. "/kaggle/input/simclr-ckpt-day2/simclr_resnet18_latest.pth"
+RESUME = None  # e.g. "/kaggle/input/simclr-ckpt/simclr_resnet18_latest.pth"
 
 
 def make_args(resume=None):
     return argparse.Namespace(
-        epochs=200,
-        batch_size=256,
-        lr=1e-3,
-        num_workers=4,
+        epochs=PRETRAIN_EPOCHS,
+        batch_size=PRETRAIN_BATCH_SIZE,
+        lr=PRETRAIN_LR,
+        num_workers=8,
         amp=True,
-        save_every=2,
+        no_compile=False,
+        save_every=10,
         diagnostic_every=10,
         resume=resume,
         output_dir="/kaggle/working/simclr",

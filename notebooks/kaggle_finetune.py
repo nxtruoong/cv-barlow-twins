@@ -20,7 +20,7 @@ sys.path.insert(0, "/kaggle/working/CV")
 
 from src.finetune import run_finetune
 
-SIMCLR_CKPT = "/kaggle/input/simclr-pretrain-final/simclr_resnet18_ep199.pth"
+SIMCLR_CKPT = "/kaggle/input/simclr-pretrain-final/simclr_resnet18_ep099.pth"
 FOLD = 0
 OUTPUT_DIR = "/kaggle/working/finetune"
 
