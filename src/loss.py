@@ -131,6 +131,36 @@ class NTXentLoss(nn.Module):
         return F.cross_entropy(sim, targets)
 
 
+class _AllReduceSum(torch.autograd.Function):
+    """Differentiable all_reduce(SUM).
+
+    Forward sums the tensor across all ranks. Backward is identity:
+    for ``y = sum_r x_r``, ``dy/dx_r = 1``, and because the loss is a
+    function of the same ``y`` on every rank, ``dL/dy`` is identical
+    across ranks — so no comm is needed in backward.
+
+    Wrapping ``dist.all_reduce`` in an autograd.Function silences the
+    PyTorch warning about an unregistered autograd kernel on ``c10d::
+    allreduce_`` and makes the gradient routing explicit.
+    """
+
+    @staticmethod
+    def forward(ctx, t: torch.Tensor) -> torch.Tensor:
+        out = t.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output
+
+
+def _all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
+    if _is_torch_dist():
+        return _AllReduceSum.apply(t)
+    return t
+
+
 class BarlowTwinsLoss(nn.Module):
     """Barlow Twins cross-correlation loss (Zbontar et al. 2021).
 
@@ -155,15 +185,16 @@ class BarlowTwinsLoss(nn.Module):
 
     def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
         local_n, dim = z_a.shape
-        # Local outer product. Don't divide here; we sum across ranks first.
+        # Local outer product; sum across ranks via differentiable all_reduce
+        # so the C matrix reflects the GLOBAL batch and gradients route back
+        # to z_a / z_b on every rank.
         c_local = z_a.T @ z_b
+        c_global = _all_reduce_sum(c_local)
         if _is_torch_dist():
-            dist.all_reduce(c_local, op=dist.ReduceOp.SUM)
-            world = dist.get_world_size()
-            global_n = local_n * world
+            global_n = local_n * dist.get_world_size()
         else:
             global_n = local_n
-        c = c_local / global_n
+        c = c_global / global_n
 
         on_diag = (torch.diagonal(c) - 1).pow(2).sum()
         off_diag_mask = ~torch.eye(dim, dtype=torch.bool, device=c.device)
