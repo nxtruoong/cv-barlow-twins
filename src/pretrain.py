@@ -93,7 +93,7 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
     df = load_driver_table()
     folds = build_group_kfold(df)
     train_idx, val_idx = folds[0]
-    eval_tf = build_pretrain_eval_transform()
+    eval_tf = build_pretrain_eval_transform(size=224)
 
     train_ds = LabeledImageDataset(
         df.iloc[train_idx]["img_path"].tolist(),
@@ -126,7 +126,11 @@ def run_pretrain(args) -> None:
         print(f"Pretrain dataset: {len(all_paths)} images "
               f"({len(pretrain_paths)} train + {len(test_paths)} test)")
 
-    view_gen = ContrastiveViewGenerator(build_pretrain_transform())
+    # BT runs at 224 square (paper baseline) with blur kernel 23 (~10% of width).
+    # The default (120x160 rect, k=15) is a SimCLR-T4 leftover.
+    view_gen = ContrastiveViewGenerator(
+        build_pretrain_transform(size=224, blur_kernel=23)
+    )
     dataset = UnlabeledImageDataset(all_paths, view_gen)
 
     per_gpu_batch = args.batch_size // max(world_size, 1)
