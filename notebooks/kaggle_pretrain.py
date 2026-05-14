@@ -5,7 +5,10 @@ Paste this into a Kaggle notebook with Accelerator = GPU T4 x2.
 Strategy:
 - Use DDP via torch.multiprocessing.spawn (notebook-friendly alternative to torchrun).
 - 200 epochs total. Save every 10. Diagnostic every 10 (linear probe + align/uniform).
-- Each session: ~5h, runs ~80 epochs at 224x224, batch 256.
+- Pretrain at 160x160 (PRETRAIN_IMG_SIZE) for ~2x FLOP cut vs 224. Phase 2
+  fine-tune upscales back to 224 (FixRes). Each session ~5h fits more epochs
+  than at 224.
+- Batch 256 at 160 uses ~6-7GB VRAM — room to bump to 384-512 if desired.
 - Resume from previous checkpoint by setting RESUME below.
 
 Day 2: session 1, epochs 0-80

@@ -4,6 +4,7 @@ from pathlib import Path
 SEED = 24521897
 
 IMG_SIZE = 224
+PRETRAIN_IMG_SIZE = 160
 NUM_CLASSES = 10
 
 CLASS_NAMES = [

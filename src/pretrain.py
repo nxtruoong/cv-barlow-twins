@@ -15,7 +15,7 @@ from timm.scheduler import CosineLRScheduler
 from tqdm import tqdm
 
 from .augmentation import build_pretrain_transform, ContrastiveViewGenerator, \
-    build_eval_transform
+    build_pretrain_eval_transform
 from .config import (
     PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_WARMUP_EPOCHS,
     PRETRAIN_LR, PRETRAIN_WEIGHT_DECAY, get_working_dir,
@@ -67,7 +67,7 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
     df = load_driver_table()
     folds = build_group_kfold(df)
     train_idx, val_idx = folds[0]
-    eval_tf = build_eval_transform()
+    eval_tf = build_pretrain_eval_transform()
 
     train_ds = LabeledImageDataset(
         df.iloc[train_idx]["img_path"].tolist(),
