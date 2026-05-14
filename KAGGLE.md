@@ -27,7 +27,7 @@ Time budget per session: ~5h. Two sessions × 40 epochs each = 80 ep total.
 ### Cell 2 — verify data + GPUs
 
 ```python
-!ls /kaggle/input/state-farm-distracted-driver-detection/imgs/train/ | head
+!ls /kaggle/input/competitions/state-farm-distracted-driver-detection/imgs/train/ | head
 !nvidia-smi -L
 ```
 
