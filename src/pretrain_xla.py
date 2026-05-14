@@ -33,7 +33,8 @@ from torch.utils.data.distributed import DistributedSampler
 from .augmentation import build_pretrain_transform, ContrastiveViewGenerator
 from .config import (
     PRETRAIN_PER_CORE_BATCH, PRETRAIN_EPOCHS, PRETRAIN_WARMUP_EPOCHS,
-    PRETRAIN_LR, PRETRAIN_WEIGHT_DECAY, get_working_dir,
+    TPU_PRETRAIN_LR, TPU_PRETRAIN_IMG_SIZE, TPU_PRETRAIN_BLUR_KERNEL,
+    PRETRAIN_WEIGHT_DECAY, get_working_dir,
 )
 from .data import MemmapUnlabeledDataset
 from .loss import NTXentLoss
@@ -92,7 +93,9 @@ def _mp_main(rank: int, args: argparse.Namespace) -> None:
         print(f"World size: {world_size}, per-core batch: {args.per_core_batch}, "
               f"global batch: {world_size * args.per_core_batch}")
 
-    view_gen = ContrastiveViewGenerator(build_pretrain_transform())
+    view_gen = ContrastiveViewGenerator(build_pretrain_transform(
+        size=TPU_PRETRAIN_IMG_SIZE, blur_kernel=TPU_PRETRAIN_BLUR_KERNEL,
+    ))
     dataset = MemmapUnlabeledDataset(view_generator=view_gen)
 
     sampler = DistributedSampler(
@@ -163,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
     p.add_argument("--per-core-batch", type=int, default=PRETRAIN_PER_CORE_BATCH)
-    p.add_argument("--lr", type=float, default=PRETRAIN_LR)
+    p.add_argument("--lr", type=float, default=TPU_PRETRAIN_LR)
     p.add_argument("--scale-lr", action="store_true", default=False,
                    help="re-scale LR by sqrt(global_batch/256) at startup")
     p.add_argument("--num-workers", type=int, default=8)

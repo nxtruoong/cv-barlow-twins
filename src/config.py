@@ -4,9 +4,14 @@ from pathlib import Path
 SEED = 24521897
 
 IMG_SIZE = 224
-PRETRAIN_IMG_SIZE = 224  # square — TPU v5e-8 plan, kills FixRes
-PRETRAIN_IMG_H = 224
-PRETRAIN_IMG_W = 224
+# T4 path: rectangular 160x120 (4:3 dashcam) to fit the GPU budget.
+PRETRAIN_IMG_SIZE = 160  # long-side, used for JPEG draft decode
+PRETRAIN_IMG_H = 120
+PRETRAIN_IMG_W = 160
+PRETRAIN_BLUR_KERNEL = 15  # ~10% of 160
+# TPU v5e-8 path: square 224 + 256-res memmap cache.
+TPU_PRETRAIN_IMG_SIZE = 224
+TPU_PRETRAIN_BLUR_KERNEL = 23  # ~10% of 224, paper default
 PRETRAIN_CACHE_RES = 256  # uint8 memmap shape: (N, 256, 256, 3)
 PRETRAIN_CACHE_PATH = "/tmp/pretrain_cache.bin"
 PRETRAIN_CACHE_INDEX = "/tmp/pretrain_cache_index.json"
@@ -28,11 +33,12 @@ CLASS_NAMES = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
-PRETRAIN_BATCH_SIZE = 2048  # global, 256/core × 8 chips on TPU v5e-8
-PRETRAIN_PER_CORE_BATCH = 256
+PRETRAIN_BATCH_SIZE = 768  # T4 default; TPU path overrides via per-core batch
+PRETRAIN_PER_CORE_BATCH = 256  # TPU v5e-8, 8 chips → global 2048
 PRETRAIN_EPOCHS = 100
 PRETRAIN_WARMUP_EPOCHS = 10
-PRETRAIN_LR = 2.828e-3  # 1e-3 * sqrt(2048/256), sqrt-rule LR scale for AdamW
+PRETRAIN_LR = 1.732e-3  # 1e-3 * sqrt(768/256), sqrt-rule LR for T4 default
+TPU_PRETRAIN_LR = 2.828e-3  # 1e-3 * sqrt(2048/256), sqrt-rule LR for TPU global batch
 PRETRAIN_WEIGHT_DECAY = 1e-4
 NT_XENT_TEMPERATURE = 0.5
 PROJECTION_DIM = 128
