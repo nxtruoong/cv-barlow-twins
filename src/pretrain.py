@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -147,11 +148,24 @@ def run_pretrain(args) -> None:
             sampler.set_epoch(epoch)
         model.train()
         scheduler.step(epoch)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         running = 0.0
         n_batches = 0
+        t_data_sum = 0.0
+        t_compute_sum = 0.0
+        pos_sum = 0.0
+        neg_sum = 0.0
+        std_sum = 0.0
+        grad_sum = 0.0
+        images_seen = 0
+        amp_verified = False
+        epoch_t0 = time.time()
         pbar = tqdm(loader, disable=not is_main(rank), desc=f"epoch {epoch}")
+        t_iter = time.time()
         for v1, v2 in pbar:
+            t_data = time.time() - t_iter
             v1 = v1.to(device, non_blocking=True)
             v2 = v2.to(device, non_blocking=True)
 
@@ -164,18 +178,81 @@ def run_pretrain(args) -> None:
                 z1, z2 = z.chunk(2, dim=0)
                 loss = loss_fn(z1, z2)
 
+            if not amp_verified and is_main(rank):
+                print(f"[amp check] z.dtype={z.dtype} (expect float16 if amp on)")
+                amp_verified = True
+
+            # Collapse / quality stats. z already L2-normalized by SimCLRModel.
+            with torch.no_grad():
+                pos_sim = (z1 * z2).sum(dim=1).mean().item()
+                B = z1.size(0)
+                sim_mat = z1 @ z2.t()  # (B, B); diagonal = positives
+                neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
+                neg_sim = sim_mat[neg_mask].mean().item()
+                embed_std = torch.cat([z1, z2], dim=0).std(dim=0).mean().item()
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=float("inf")
+            ).item()
             scaler.step(optimizer)
             scaler.update()
 
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_compute = time.time() - t_iter - t_data
+            t_data_sum += t_data
+            t_compute_sum += t_compute
+
             running += loss.item()
+            pos_sum += pos_sim
+            neg_sum += neg_sim
+            std_sum += embed_std
+            grad_sum += grad_norm
             n_batches += 1
+            images_seen += v.size(0)
             if is_main(rank):
-                pbar.set_postfix(loss=running / n_batches)
+                pbar.set_postfix(
+                    loss=running / n_batches,
+                    pos=pos_sum / n_batches,
+                    neg=neg_sum / n_batches,
+                    std=std_sum / n_batches,
+                    gn=grad_sum / n_batches,
+                )
+            t_iter = time.time()
+
+        epoch_sec = time.time() - epoch_t0
+        throughput = images_seen / max(epoch_sec, 1e-6)
+        gpu_mem_peak_gb = (
+            torch.cuda.max_memory_allocated(device) / 1e9
+            if device.type == "cuda" else 0.0
+        )
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if is_main(rank):
+            print(f"[ep {epoch}] avg data={t_data_sum/max(n_batches,1):.3f}s "
+                  f"compute={t_compute_sum/max(n_batches,1):.3f}s "
+                  f"-> {'IO-bound' if t_data_sum > t_compute_sum else 'compute-bound'} "
+                  f"| {throughput:.0f} img/s | {epoch_sec/60:.1f} min "
+                  f"| peak_mem={gpu_mem_peak_gb:.2f} GB | lr={current_lr:.2e}")
 
         epoch_loss = running / max(n_batches, 1)
-        log_entry = {"epoch": epoch, "loss": epoch_loss}
+        log_entry = {
+            "epoch": epoch,
+            "loss": epoch_loss,
+            "pos_sim": pos_sum / max(n_batches, 1),
+            "neg_sim": neg_sum / max(n_batches, 1),
+            "embed_std": std_sum / max(n_batches, 1),
+            "grad_norm": grad_sum / max(n_batches, 1),
+            "lr": current_lr,
+            "throughput_img_s": throughput,
+            "epoch_sec": epoch_sec,
+            "gpu_mem_peak_gb": gpu_mem_peak_gb,
+            "t_data_avg": t_data_sum / max(n_batches, 1),
+            "t_compute_avg": t_compute_sum / max(n_batches, 1),
+        }
 
         if is_main(rank) and (epoch + 1) % args.diagnostic_every == 0:
             base = model.module if hasattr(model, "module") else model
