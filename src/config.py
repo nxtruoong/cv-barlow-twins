@@ -40,7 +40,7 @@ FINETUNE_BATCH_SIZE = 128
 
 N_FOLDS = 5
 
-KAGGLE_INPUT = Path("/kaggle/input/state-farm-distracted-driver-detection")
+KAGGLE_INPUT = Path("/kaggle/input/competitions/state-farm-distracted-driver-detection")
 KAGGLE_WORKING = Path("/kaggle/working")
 
 LOCAL_DATA = Path("data/state-farm-distracted-driver-detection")

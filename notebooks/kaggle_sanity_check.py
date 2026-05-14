@@ -1,7 +1,7 @@
 """Day 1: sanity checks before burning GPU days.
 
 Paste this into a Kaggle notebook cell. Requires the State Farm dataset attached
-to the notebook (input path: /kaggle/input/state-farm-distracted-driver-detection).
+to the notebook (input path: /kaggle/input/competitions/state-farm-distracted-driver-detection).
 
 Run this once. Verifies:
 - driver_imgs_list.csv parses + filenames match
