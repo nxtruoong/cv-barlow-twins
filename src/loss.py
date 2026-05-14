@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from .config import NT_XENT_TEMPERATURE
+from .config import NT_XENT_TEMPERATURE, BT_LAMBDA
 
 
 try:
@@ -129,6 +129,67 @@ class NTXentLoss(nn.Module):
         targets = (targets + batch) % (2 * batch)
 
         return F.cross_entropy(sim, targets)
+
+
+class BarlowTwinsLoss(nn.Module):
+    """Barlow Twins cross-correlation loss (Zbontar et al. 2021).
+
+    Inputs z_a, z_b are projector outputs AFTER a final ``BatchNorm1d(D,
+    affine=False)`` layer (converted to SyncBN under DDP). The BN layer
+    handles the per-feature batch normalization that BT requires; no extra
+    L2 / batch normalization here.
+
+    Loss::
+
+        C = z_a.T @ z_b / N            # (D, D), N = global batch size
+        L = sum((diag(C) - 1)**2) + lambda * sum(off_diag(C)**2)
+
+    Under DDP each rank produces a local outer product; we sum across ranks
+    via ``dist.all_reduce`` so the C matrix reflects the GLOBAL batch.
+    Without this, C is per-rank only and decorrelation pressure undertrains.
+    """
+
+    def __init__(self, lambda_off: float = BT_LAMBDA):
+        super().__init__()
+        self.lambda_off = lambda_off
+
+    def forward(self, z_a: torch.Tensor, z_b: torch.Tensor) -> torch.Tensor:
+        local_n, dim = z_a.shape
+        # Local outer product. Don't divide here; we sum across ranks first.
+        c_local = z_a.T @ z_b
+        if _is_torch_dist():
+            dist.all_reduce(c_local, op=dist.ReduceOp.SUM)
+            world = dist.get_world_size()
+            global_n = local_n * world
+        else:
+            global_n = local_n
+        c = c_local / global_n
+
+        on_diag = (torch.diagonal(c) - 1).pow(2).sum()
+        off_diag_mask = ~torch.eye(dim, dtype=torch.bool, device=c.device)
+        off_diag = c[off_diag_mask].pow(2).sum()
+        return on_diag + self.lambda_off * off_diag
+
+
+@torch.no_grad()
+def cross_correlation_stats(z_a: torch.Tensor, z_b: torch.Tensor) -> dict:
+    """Diag mean and off-diag rms of the cross-correlation matrix.
+
+    Healthy training: ``diag_mean`` -> 1.0, ``off_diag_rms`` -> ~0.05–0.1.
+    Collapse signature: ``diag_mean`` stuck below ~0.3 by epoch 20.
+    """
+    local_n, dim = z_a.shape
+    c_local = z_a.T @ z_b
+    if _is_torch_dist():
+        dist.all_reduce(c_local, op=dist.ReduceOp.SUM)
+        global_n = local_n * dist.get_world_size()
+    else:
+        global_n = local_n
+    c = c_local / global_n
+    diag_mean = torch.diagonal(c).mean().item()
+    off_mask = ~torch.eye(dim, dtype=torch.bool, device=c.device)
+    off_rms = c[off_mask].pow(2).mean().sqrt().item()
+    return {"c_diag_mean": diag_mean, "c_offdiag_rms": off_rms}
 
 
 def alignment_uniformity(z1: torch.Tensor, z2: torch.Tensor) -> dict:

@@ -1,4 +1,4 @@
-# Project Runbook — SimCLR + ResNet-18 on State Farm
+# Project Runbook — Barlow Twins + ResNet-18 on State Farm
 
 End-to-end execution guide. Pair with `PLAN.md` (experimental design) and `README.md` (overview).
 
@@ -85,19 +85,19 @@ All fold subject overlaps = 0. GroupKFold OK.
 
 ---
 
-## Day 2 — SimCLR pretrain (1 session if possible, ~8-9h)
+## Day 2 — Barlow Twins pretrain (session 1: ~5h, epochs 1–40)
 
-**Goal:** train SimCLR end-to-end in single session. Fallback: 2 sessions.
+**Goal:** train BT for 40 epochs in session 1. Resume next session for 41–80.
 
 **Timing math:**
-- 399 steps/epoch × ~350ms/step ≈ 2.3 min/epoch
-- 200 epochs × 2.3 min ≈ 7.7h training + ~20 min diagnostics
-- Kaggle interactive cap ~9h → tight but feasible
+- 399 steps/epoch × ~1.0s/step ≈ 6.7 min/epoch (SyncBN + 2048³ projector overhead)
+- 40 epochs × 6.7 min ≈ 4.5h + ~10 min linear probe at ep 20/40
+- Kaggle interactive cap ~9h → comfortable
 
-**Mid-run sanity:** after epoch 1 stabilizes, check tqdm `it/s`:
-- ≥ 3 it/s → on track for 1 session
-- < 2 it/s → data loader bottleneck. Stop, bump num_workers=8, restart
-- ETA = (399 / it_per_sec × 200) / 3600 hours
+**Mid-run sanity:** after epoch 1 stabilizes, check tqdm `it/s` and postfix:
+- ≥ 1 it/s → on track
+- < 0.5 it/s → data loader bottleneck. Stop, bump num_workers=4, restart
+- `diag` field should rise toward 1.0; `off` field should fall below 0.2 by ep 10
 
 ### 2.1 New notebook
 Same data input attached. Settings:
@@ -118,45 +118,40 @@ exec(open("/kaggle/working/CV/notebooks/kaggle_pretrain.py").read())
 `RESUME = None` already set. DDP via `mp.spawn` auto-detects 2 GPUs.
 
 ### 2.4 Monitor
-- tqdm shows per-epoch loss
-- Every 10 epochs: `align`, `uniform`, `probe_acc`, `probe_ll` printed
-- Checkpoint saved every 10 epochs to `/kaggle/working/simclr/`
+- tqdm shows per-epoch loss + `diag`, `off` postfix every 20 steps
+- Every epoch the log_entry records `c_diag_mean` and `c_offdiag_rms`
+- Linear probe runs at epochs 20 and 40 in this session
+- Checkpoint saved every 10 epochs to `/kaggle/working/bt/`
 
 **Healthy trajectory:**
-| Epoch | Loss | probe_acc |
-|---|---|---|
-| 0 | ~6.5 | ~0.10 |
-| 10 | ~5.5 | ~0.20 |
-| 30 | ~4.5 | ~0.45 |
-| 80 | ~4.0 | ~0.65 |
+| Epoch | Loss | c_diag_mean | c_offdiag_rms | probe_acc |
+|---|---|---|---|---|
+| 0 | ~2000 | ~0.05 | ~0.4 | — |
+| 10 | ~500 | ~0.4 | ~0.2 | — |
+| 20 | ~200 | ~0.6 | ~0.12 | ~0.35 |
+| 40 | ~80 | ~0.8 | ~0.08 | ~0.55 |
 
-If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug.
+**Pre-registered abort criteria (epoch 20):** if `probe_acc < 0.25` AND `c_diag_mean < 0.3` AND `c_offdiag_rms > 0.4` → start Condition A scratch fine-tune in parallel; let BT run to completion and report outcome honestly (per ADR-0003).
 
-### 2.5 If session finishes (200 epochs done)
-1. Verify final ckpt:
+### 2.5 End of session (epoch 40 reached)
+1. Verify checkpoint:
    ```python
-   !ls -la /kaggle/working/simclr/
+   !ls -la /kaggle/working/bt/
    ```
-   Expect `simclr_resnet18_ep199.pth` + `simclr_resnet18_latest.pth` + `history.json`.
-2. Download `simclr_resnet18_ep199.pth` + `history.json`
-3. Upload as Kaggle Dataset titled `simclr-pretrain-final`
-4. Skip Day 3, jump to Day 4 PM (finetune)
-
-### 2.6 If session times out before ep200 (fallback)
-1. Note epoch reached (e.g. ep~150)
-2. Download `simclr_resnet18_latest.pth`
-3. Upload as Kaggle Dataset `simclr-ckpt-resume`
-4. Go to Day 3 (resume session)
+   Expect `bt_resnet18_ep039.pth` + `bt_resnet18_latest.pth` + `history.json`.
+2. Download `bt_resnet18_latest.pth`
+3. Upload as Kaggle Dataset `bt-ckpt-resume`
+4. Go to Day 3 (resume for epochs 41–80)
 
 ---
 
-## Day 3 — Pretrain resume session (only if Day 2 timed out)
+## Day 3 — Barlow Twins pretrain (session 2: epochs 41–80, ~5h)
 
 ### 3.1 New notebook
 - GPU T4 x2, Internet On
 - Attach inputs:
   - State Farm Distracted Driver Detection (competition)
-  - `simclr-ckpt-resume` (Day 2 partial ckpt)
+  - `bt-ckpt-resume` (Day 2 partial ckpt)
 
 ### 3.2 Clone + set resume path
 ```python
@@ -164,7 +159,7 @@ If `probe_acc` < 0.20 at epoch 30 → **STOP**. Aug or temperature broken. Debug
 !pip install -q timm
 ```
 
-Edit `notebooks/kaggle_pretrain.py` line ~32 before exec, OR inline:
+Edit `notebooks/kaggle_pretrain.py` `RESUME` line before exec, OR inline:
 ```python
 import sys, os, argparse
 REPO = "/kaggle/working/CV"
@@ -173,12 +168,14 @@ os.environ["PYTHONPATH"] = REPO + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 import torch, torch.multiprocessing as mp
 from src.pretrain import run_pretrain, ddp_worker
+from src.config import BT_BATCH_SIZE, BT_EPOCHS, BT_LR, BT_LAMBDA
 
-RESUME = "/kaggle/input/simclr-ckpt-resume/simclr_resnet18_latest.pth"
+RESUME = "/kaggle/input/bt-ckpt-resume/bt_resnet18_latest.pth"
 args = argparse.Namespace(
-    epochs=200, batch_size=256, lr=1e-3, num_workers=4, amp=True,
-    save_every=10, diagnostic_every=10, resume=RESUME,
-    output_dir="/kaggle/working/simclr",
+    epochs=BT_EPOCHS, batch_size=BT_BATCH_SIZE, lr=BT_LR,
+    lambda_off=BT_LAMBDA, num_workers=2, amp=True,
+    save_every=10, resume=RESUME,
+    output_dir="/kaggle/working/bt",
 )
 world_size = torch.cuda.device_count()
 if world_size > 1:
@@ -190,21 +187,21 @@ else:
 ### 3.3 Verify resume
 First print after launch:
 ```
-Resumed from /kaggle/input/simclr-ckpt-resume/simclr_resnet18_latest.pth at epoch <N>
+Resumed from /kaggle/input/bt-ckpt-resume/bt_resnet18_latest.pth at epoch <N>
 ```
 
 ### 3.4 End of session
-Download `simclr_resnet18_ep199.pth` + `history.json`. Upload as `simclr-pretrain-final`.
+Download `bt_resnet18_ep079.pth` + `history.json`. Upload as `bt-pretrain-final`.
 
 ---
 
 ## Day 4 PM — Fine-tune 3 conditions, fold 0 (~3h)
 
-**Goal:** A_scratch vs B_simclr vs C_imagenet on fold 0. Pick winner by val log loss.
+**Goal:** A_scratch vs B_bt vs C_imagenet on fold 0. Pick winner by val log loss.
 
 ### 4.3 New notebook
 - GPU T4 x2 (only 1 used, but parallel sessions allowed)
-- Attach: competition data + `simclr-pretrain-final`
+- Attach: competition data + `bt-pretrain-final`
 
 ### 4.4 Run finetune
 ```python
@@ -219,7 +216,7 @@ Trains 3 models sequentially. ~45 min each.
 ```
 =========== Headline ===========
   A_scratch:  val_log_loss = 0.XXXX
-  B_simclr:   val_log_loss = 0.XXXX
+  B_bt:   val_log_loss = 0.XXXX
   C_imagenet: val_log_loss = 0.XXXX
 
 Winner: <condition>
@@ -245,7 +242,7 @@ Save all 3 bundles (download from `/kaggle/working/finetune/`).
 
 Edit `kaggle_finetune_kfold.py` line 15 (or inline):
 ```python
-WINNER_CONDITION = "B_simclr"  # or whichever won
+WINNER_CONDITION = "B_bt"  # or whichever won
 ```
 
 ```python
@@ -280,7 +277,7 @@ pip install -r requirements.txt
 ### 5.2 Download bundles
 From Day 4 PM notebook output, download into `outputs/finetune/`:
 - `demo_bundle_A_scratch_fold0.pth`
-- `demo_bundle_B_simclr_fold0.pth`
+- `demo_bundle_B_bt_fold0.pth`
 - `demo_bundle_C_imagenet_fold0.pth`
 
 ### 5.3 OOD images
@@ -294,7 +291,7 @@ python notebooks/demo.py
 Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for all 3 models.
 
 ### 5.5 Qualitative assessment
-- Does B_simclr or C_imagenet generalize better OOD?
+- Does B_bt or C_imagenet generalize better OOD?
 - Where does Grad-CAM look? (hands? phone? face?)
 - Document findings in `PLAN.md` § 10.
 
@@ -310,8 +307,9 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 - **Competition data mounts at `/kaggle/input/competitions/<slug>/`** on newer Kaggle. Older docs say `/kaggle/input/<slug>/`. Verify with `!ls /kaggle/input/`.
 
 ### Training
-- **DDP world_size=2 → per-GPU batch 128.** Effective batch still 256 because NT-Xent gathers across ranks.
-- **Do NOT use gradient accumulation** to fake larger batch — breaks NT-Xent in-batch negatives.
+- **DDP world_size=2 → per-GPU batch 128.** Effective batch still 256 because BT all-reduces the local outer product across ranks before computing C.
+- **SyncBatchNorm must be applied BEFORE wrapping in DDP.** `src/pretrain.py` does this via `BarlowTwinsModel.convert_sync_bn(model)`. Without it, the final projector BN normalizes per-GPU → per-GPU C matrix → silent undertraining.
+- **Do NOT use gradient accumulation** to fake larger batch — desynchronizes BN/C-matrix statistics from the optimizer step.
 - **No horizontal flip** in aug — would mix "phone right" with "phone left" classes.
 - **GroupKFold by subject** is non-negotiable. Random split = driver leakage = inflated val acc.
 
@@ -327,21 +325,23 @@ Produces per-image 3-row figures: image + class prob bars + Grad-CAM overlay for
 | Task | File | Notes |
 |---|---|---|
 | Constants/paths | `src/config.py` | Change `KAGGLE_INPUT` if mount differs |
-| Pretrain entry | `src/pretrain.py` | DDP-aware, `mp.spawn` from notebook |
+| Pretrain entry | `src/pretrain.py` | Barlow Twins, DDP-aware, `mp.spawn` from notebook |
 | Finetune entry | `src/finetune.py` | 2-stage (freeze → discriminative LR) |
 | Submission | `src/submit.py` | TTA 5-crop, no flip, clip [1e-15, 1-1e-15] |
 | Augmentation | `src/augmentation.py` | NO horizontal flip |
 | Group splits | `src/data.py` | `build_group_kfold(df)` |
-| NT-Xent loss | `src/loss.py` | `gather_distributed=True` for DDP |
+| Barlow Twins loss | `src/loss.py` | `BarlowTwinsLoss` + `dist.all_reduce` of local outer product |
+| Phase 1 ADR | `docs/adr/0003-barlow-twins-over-simclr.md` | Method choice, projector dim, fallback policy |
 
 ---
 
 ## Checklist (tick as you go)
 
 - [ ] Day 1: sanity check passes, no fold leakage
-- [ ] Day 2: pretrain to ep200 (or partial ckpt uploaded if timeout)
-- [ ] Day 3: pretrain resume to ep200 (skip if Day 2 finished)
-- [ ] `simclr-pretrain-final` dataset uploaded
+- [ ] Day 2: BT pretrain to ep40 (session 1); partial ckpt uploaded
+- [ ] Day 3: BT pretrain resume to ep80 (session 2)
+- [ ] Epoch 20 abort criteria checked (probe/diag/off-rms thresholds)
+- [ ] `bt-pretrain-final` dataset uploaded
 - [ ] Day 4 PM: 3 conditions trained fold 0, headline recorded
 - [ ] Day 4 Late: 5-fold ensemble of winner, submission CSV generated
 - [ ] Submitted to Kaggle, public LB score recorded

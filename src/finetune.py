@@ -96,7 +96,9 @@ def run_finetune(args) -> dict:
     val_loader = make_loader(val_ds, args.batch_size, shuffle=False,
                              num_workers=args.num_workers)
 
-    model = build_classifier_for_condition(args.condition, args.simclr_ckpt).to(device)
+    model = build_classifier_for_condition(
+        args.condition, ssl_ckpt_path=args.ssl_ckpt or args.simclr_ckpt,
+    ).to(device)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=FINETUNE_LABEL_SMOOTHING)
     scaler = GradScaler("cuda", enabled=args.amp)
 
@@ -180,10 +182,12 @@ def run_finetune(args) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--condition", required=True,
-                   choices=["A_scratch", "B_simclr", "C_imagenet"])
+                   choices=["A_scratch", "B_bt", "B_simclr", "C_imagenet"])
     p.add_argument("--fold", type=int, default=0)
+    p.add_argument("--ssl-ckpt", type=str, default=None,
+                   help="Required for B_bt or B_simclr.")
     p.add_argument("--simclr-ckpt", type=str, default=None,
-                   help="Required for B_simclr.")
+                   help="Deprecated alias for --ssl-ckpt; kept for back-compat.")
     p.add_argument("--batch-size", type=int, default=FINETUNE_BATCH_SIZE)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--amp", action="store_true", default=True)

@@ -25,7 +25,7 @@ from src.config import CLASS_NAMES
 
 BUNDLE_PATHS = {
     "A_scratch": "outputs/finetune/demo_bundle_A_scratch_fold0.pth",
-    "B_simclr": "outputs/finetune/demo_bundle_B_simclr_fold0.pth",
+    "B_bt": "outputs/finetune/demo_bundle_B_bt_fold0.pth",
     "C_imagenet": "outputs/finetune/demo_bundle_C_imagenet_fold0.pth",
 }
 DEMO_IMAGE_DIR = Path("demo_images")

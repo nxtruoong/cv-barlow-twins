@@ -1,6 +1,6 @@
-# SimCLR + ResNet-18 on State Farm Distracted Driver Detection
+# Barlow Twins + ResNet-18 on State Farm Distracted Driver Detection
 
-**Experimental study:** Evaluate SimCLR self-supervised pretraining as a solution for the State Farm Kaggle competition under free-tier resource constraints (Kaggle T4 x2, no paid compute).
+**Experimental study:** Evaluate Barlow Twins self-supervised pretraining as a solution for the State Farm Kaggle competition under free-tier resource constraints (Kaggle T4 x2, no paid compute). Method choice rationale and superseded SimCLR plan: see ADR-0003 and ADR-0001.
 
 **Reproducibility seed:** `24521897` (apply everywhere — model init, GroupKFold, DataLoader workers, augmentation RNG).
 
@@ -12,8 +12,8 @@ Define before running experiments to avoid post-hoc rationalization.
 
 | Hypothesis | Test | Pass | Marginal | Fail |
 |---|---|---|---|---|
-| **H1**: SimCLR pretrain improves over random init | B vs A val log loss | improvement ≥ 0.05 | 0.01 ≤ Δ < 0.05 | Δ < 0.01 |
-| **H2**: SimCLR competitive with ImageNet pretrain | B vs C val log loss | B ≤ C + 0.10 | — | B − C > 0.10 |
+| **H1**: Barlow Twins pretrain improves over random init | B vs A val log loss | improvement ≥ 0.05 | 0.01 ≤ Δ < 0.05 | Δ < 0.01 |
+| **H2**: Barlow Twins competitive with ImageNet pretrain | B vs C val log loss | B ≤ C + 0.10 | — | B − C > 0.10 |
 | **H3**: Combined approach value | B + C ensemble vs C alone | ensemble > C | — | ensemble ≤ C |
 
 Calibrate thresholds after Condition A fold 1 anchor result. Random baseline log loss ≈ 2.3.
@@ -27,7 +27,7 @@ Three conditions, identical fine-tune protocol, only backbone init varies.
 | Condition | Backbone init | Question answered |
 |---|---|---|
 | **A** Pure baseline | ResNet-18 random init | Supervised only on 22k labeled |
-| **B** SimCLR (main) | ResNet-18 random + SimCLR pretrain on 102k | Does SimCLR help vs scratch? |
+| **B** Barlow Twins (main) | ResNet-18 random + BT pretrain on 102k | Does BT help vs scratch? |
 | **C** ImageNet | ResNet-18 ImageNet pretrained | Strong real-world baseline |
 
 **Controlled variables (must match across A, B, C):** GroupKFold split, augmentation pipeline, optimizer, LR schedule, label smoothing, 2-stage fine-tune, TTA, K-fold ensemble, seed.
@@ -63,12 +63,14 @@ folds = list(gkf.split(X, y, groups=subject_ids))
 
 ---
 
-## 4. SimCLR Pretraining (Condition B only)
+## 4. Barlow Twins Pretraining (Condition B only)
 
 ### Architecture
 - **Backbone**: `models.resnet18(weights=None)` — random init.
-- **Projection head**: `Linear(512 → 512) → ReLU → Linear(512 → 128)`. Discarded after pretrain.
-- **Loss**: NT-Xent, temperature τ = 0.5.
+- **Projector body**: `Linear(512→2048, bias=False) → BN → ReLU → Linear(2048→2048, bias=False) → BN → ReLU → Linear(2048→2048, bias=False)`.
+- **Final per-view layer**: `BatchNorm1d(2048, affine=False)` — paper-mandated batch normalization that replaces manual `(z − mean) / std` before the cross-correlation matrix. Applied independently to each augmented view.
+- **Loss**: Barlow Twins cross-correlation; λ_off = 5e-3.
+- **All projector pieces discarded after Phase 1.**
 
 ### Augmentation pipeline
 ```python
@@ -83,69 +85,79 @@ pretrain_aug = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 # NO RandomHorizontalFlip — flips break left/right hand class identity
+# Symmetric across views (not BYOL-style asymmetric); aug held constant
+# across conditions A/B/C so SSL loss is the only variable.
 ```
 
 ### Multi-GPU + Loss Computation
 **Setup**: 2× T4 via DDP, batch 256 (128 per GPU).
 
-**Critical**: NT-Xent loss requires gathering features across GPUs before computing loss. Naive DDP gives only per-GPU negatives. Use `lightly`'s built-in handling:
-
+**Critical 1 — SyncBN on the final projector BN:**
 ```python
-from lightly.loss import NTXentLoss
-loss_fn = NTXentLoss(temperature=0.5, gather_distributed=True)
+import torch.nn as nn
+model = BarlowTwinsModel(...).cuda()
+model = nn.SyncBatchNorm.convert_sync_batchnorm(model)  # BEFORE DDP wrap
+model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+```
+Without `SyncBN`, the final `BatchNorm1d(affine=False)` normalizes using per-GPU stats only → per-GPU C matrix → silent undertraining. Loss looks plausible, linear probe stalls.
+
+**Critical 2 — global C matrix via cross-rank reduce:**
+```python
+# Inside BarlowTwinsLoss.forward (each rank):
+c_local = z_a.T @ z_b               # local outer product, (D, D)
+dist.all_reduce(c_local, op=dist.ReduceOp.SUM)
+c = c_local / (local_n * world_size)  # divide by GLOBAL batch
+# Loss computed identically on all ranks; DDP averages gradients normally.
 ```
 
-Manual implementation must preserve local gradient:
-```python
-def gather_features(z):
-    z_list = [torch.zeros_like(z) for _ in range(world_size)]
-    dist.all_gather(z_list, z)
-    z_list[rank] = z  # critical: preserve gradient for local rank
-    return torch.cat(z_list, dim=0)
-```
-
-**DO NOT use gradient accumulation** to fake larger batch. Gradient accumulation breaks NT-Xent (each accumulation step still only sees its local batch's negatives; gradients average across separate small-batch losses, not equivalent to large-batch loss).
+**DO NOT use gradient accumulation** to fake larger batch. BT batch statistics in the final BN and C matrix would be computed on smaller-than-intended subsets per step.
 
 ### Optimizer & Schedule
 ```python
 optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-# 10-epoch linear warmup: 0 → 1e-3
-# Cosine decay epochs 10-200: 1e-3 → 0
+# 10-epoch linear warmup: 1e-6 → 1e-3
+# Cosine decay epochs 10–80: 1e-3 → 0
 from timm.scheduler import CosineLRScheduler
 scheduler = CosineLRScheduler(
-    optimizer, t_initial=200, warmup_t=10,
+    optimizer, t_initial=80, warmup_t=10,
     warmup_lr_init=1e-6, lr_min=0,
 )
 ```
 
-Mixed precision: `torch.cuda.amp` (FP16).
+Mixed precision: `torch.cuda.amp` (FP16) via `GradScaler`. LARS rejected — designed for batch ≥ 4096; at batch 256 its layer-wise trust ratio adds noise without benefit. Paper's wd=1.5e-6 dropped — keep 1e-4 to match Condition A optimizer (single-variable comparison); flag as tuning knob if linear probe stalls.
 
 ### Diagnostics during pretrain — REQUIRED
-Run every 10 epochs to catch silent failure:
 
-**1. Linear probe accuracy**
+**1. C-matrix statistics — every epoch (free, computed during loss):**
+```python
+diag_mean = torch.diagonal(C).mean()        # target → 1.0
+off_rms   = (C[~eye(D, bool)]**2).mean().sqrt()  # target → 0.05–0.1
+# Collapse signature: diag_mean stuck below 0.3 by epoch 20.
+```
+
+**2. Linear probe accuracy — at epochs 20, 40, 60, 80 only** (heavier; gating signal already covered by C-matrix stats):
 ```python
 # Freeze backbone, train Linear(512 → 10) on 1 fold of labeled data
 # 50 epochs, AdamW lr=1e-3
-# Healthy curve: ep10 ~35%, ep50 ~60%, ep100 ~75%, ep200 ~80%
-# Stuck near random (10%) by ep30 → SSL is broken, stop and debug
+# Healthy: ep20 ~30–40%, ep40 ~55%, ep60 ~70%, ep80 ~75%
+# Stuck near random (10%) by ep20 → SSL broken; pre-registered abort.
 ```
 
-**2. Alignment & uniformity** (Wang & Isola, 2020)
-```python
-align = (z_i - z_j).norm(dim=1).pow(2).mean()
-uniform = torch.pdist(z, p=2).pow(2).mul(-2).exp().mean().log()
-# Both should decrease together. Uniform stuck near 0 = collapse.
-```
+**3. Pre-registered failure fallback** (per ADR-0003):
+At epoch 20, if ALL of {linear probe < 25%, c_diag_mean < 0.3, off_rms > 0.4}:
+- Do NOT abort training (sunk cost — let final ckpt complete and report)
+- Start Condition A (scratch) fine-tune in parallel
+- Report BT honestly as "collapsed under budget" + working A vs C comparison
 
 ### Checkpointing
-- Save every 10 epochs to `/kaggle/working/`
-- Upload to Kaggle Dataset for resumption next session
-- Filename: `simclr_resnet18_ep{N}_seed24521897.pth`
+- Save every 10 epochs to `/kaggle/working/bt/`
+- Filename: `bt_resnet18_ep{N}.pth` + sliding `bt_resnet18_latest.pth`
+- Upload `_latest.pth` to a Kaggle Dataset between sessions for resume
 
 ### Time budget
-- ~400 iter/epoch (102k / 256) × ~0.4s/iter ≈ 3 min/epoch on T4 x2
-- 200 epochs ≈ 10 hours total → split across 2 Kaggle sessions (5h each)
+- ~400 iter/epoch (102k / 256) × ~1.0s/iter ≈ 7 min/epoch on T4 x2 (SyncBN ~5% overhead, 2048³ projector, fp16)
+- 80 epochs ≈ 9.3 hours of pure training + diagnostics + Kaggle session boot
+- Split across 2 sessions (5h × 40 epochs each), resume via `_latest.pth`
 
 ---
 
@@ -249,7 +261,7 @@ torch.save({
     ],
     'preprocessing': {'resize': 224, 'mean': [0.485, 0.456, 0.406],
                       'std': [0.229, 0.224, 0.225]},
-    'condition': 'B_simclr',  # or 'A_scratch' / 'C_imagenet'
+    'condition': 'B_bt',  # or 'A_scratch' / 'C_imagenet'
 }, f'demo_bundle_{condition}.pth')
 ```
 
@@ -307,7 +319,7 @@ def show_with_gradcam(img_path, model, class_names, target_layer):
 
 ### Talking points for teacher
 - **Domain gap is expected.** State Farm is narrow distribution; Google images are OOD. Degraded confidence is correct behavior, not a bug.
-- **Compare 3 conditions side-by-side on same image.** Expected: ImageNet (C) generalizes best, SimCLR (B) most overfit to State Farm cabin specifics.
+- **Compare 3 conditions side-by-side on same image.** Expected: ImageNet (C) generalizes best, Barlow Twins (B) most overfit to State Farm cabin specifics.
 - **Grad-CAM proves the model isn't memorizing noise.** For texting class, heatmap should highlight hands/phone region. If it focuses on face only → spurious features → discussion point.
 
 ---
@@ -339,9 +351,9 @@ set_seed()
 | Day | Task | Hours |
 |---|---|---|
 | 1 | Pipeline code + augmentation + dry run (1 epoch each stage) | 4 |
-| 2 | SimCLR pretrain session 1 (epoch 1–80) + linear probe | 5 |
-| 3 | SimCLR pretrain session 2 (epoch 81–160) + linear probe | 5 |
-| 4 AM | SimCLR pretrain session 3 (epoch 161–200) + fine-tune all 3 conditions (1 fold each) | 6 |
+| 2 | Barlow Twins pretrain session 1 (epoch 1–40) + linear probe at ep 20/40 | 5 |
+| 3 | Barlow Twins pretrain session 2 (epoch 41–80) + linear probe at ep 60/80 | 5 |
+| 4 AM | Fine-tune all 3 conditions (1 fold each) | 4 |
 | 4 PM | Pick winner, 5-fold ensemble on winner, LB submission | 4 |
 | 5 | Save 3 demo bundles, build `demo.ipynb` with Grad-CAM, pick Google images, screenshots for slides | 3 |
 
@@ -355,7 +367,7 @@ Fill after experiments complete.
 | Condition | Val log loss (fold 1) | LB log loss (single) | LB log loss (5-fold ensemble) |
 |---|---|---|---|
 | A scratch | ? | ? | (winner only) |
-| B SimCLR | ? | ? | (winner only) |
+| B Barlow Twins | ? | ? | (winner only) |
 | C ImageNet | ? | ? | (winner only) |
 
 ### Verdict
@@ -364,17 +376,18 @@ Fill after experiments complete.
 - H3: [ ] Pass [ ] Fail
 
 ### Linear probe progression (Condition B)
-| Epoch | Linear probe acc | NT-Xent loss | Alignment | Uniformity |
+| Epoch | Linear probe acc | BT loss | C diag mean | Off-diag rms |
 |---|---|---|---|---|
-| 10 | ? | ? | ? | ? |
-| 50 | ? | ? | ? | ? |
-| 100 | ? | ? | ? | ? |
-| 200 | ? | ? | ? | ? |
+| 20 | ? | ? | ? | ? |
+| 40 | ? | ? | ? | ? |
+| 60 | ? | ? | ? | ? |
+| 80 | ? | ? | ? | ? |
 
 ### Discussion points
-- Did SimCLR features transfer to OOD Google images better/worse than ImageNet?
+- Did Barlow Twins features transfer to OOD Google images better/worse than ImageNet?
 - What did Grad-CAM reveal about feature locality?
-- Was 200 epochs enough or did probe still improve at the end?
+- Was 80 epochs enough or did probe still improve at the end?
+- Did C-matrix diag/off-diag converge to ~1.0 / ~0.05, or did either stall?
 
 ---
 
@@ -383,11 +396,15 @@ Fill after experiments complete.
 | Method | Why not chosen | When to revisit |
 |---|---|---|
 | ImageNet pretrained + supervised only (no SSL) | Defeats experimental purpose | If only goal is LB rank |
-| MoCo v2 | Queue-based negatives, more memory-efficient than SimCLR, no need for huge batch. Trade-off: more complex, slightly weaker on small datasets | If batch 256 still insufficient |
-| BYOL / SimSiam | No negatives needed, smaller batch OK. Trade-off: collapse risk without careful momentum encoder / predictor design | If SimCLR collapses despite diagnostics |
-| SupCon (Supervised Contrastive) | Uses labels during contrastive phase. Higher expected accuracy. Trade-off: not self-supervised, doesn't use unlabeled test data | If H2 fails and you want labeled-data SOTA |
-| Pseudo-labeling | Train supervised, label test set, retrain. Simple, effective. Trade-off: noisy labels amplify errors | Day 5 stretch goal if time permits |
-| LARS optimizer | Designed for batch ≥ 4096. Unstable at batch 256 | If scaling to multi-node compute |
-| Gradient accumulation for batch >256 | Breaks NT-Xent (per-step negatives only) | Never for contrastive loss |
+| **SimCLR + NT-Xent** | Popular Kaggle default → unoriginal; requires large batch + differentiable cross-rank all-gather plumbing. Superseded per ADR-0003; code retained on `tpu-v5e-8-snapshot` branch | If BT collapses and a known-working fallback is needed |
+| MoCo v2 | Queue-based negatives, memory-efficient. Trade-off: more moving parts than BT (queue, momentum encoder); also contrastive-family | If batch 256 still insufficient for BT |
+| BYOL / SimSiam | No negatives, smaller batch OK. Trade-off: collapse risk without careful momentum / predictor design; same originality slot as BT but more failure modes | If BT collapses despite diagnostics |
+| MAE / SparK (masked image modeling on ConvNets) | Originality high but sparse-conv kernel deps unproven on Kaggle; schedule risk | Post-deadline experiment |
+| DINO with ResNet | Self-distillation, no negatives. Trade-off: momentum encoder + multi-crop ~2.5× compute over budget on T4 | If a future budget allows ~25hr pretrain |
+| Rotation pretext (Gidaris 2018) | Textbook SSL; teacher would call it more unoriginal than SimCLR | Never (in this project) |
+| SupCon (Supervised Contrastive) | Higher accuracy. Trade-off: not self-supervised, ignores unlabeled test data | If H2 fails and labeled-data SOTA is the goal |
+| Pseudo-labeling | Train supervised, label test set, retrain. Trade-off: noisy labels amplify errors | Day 5 stretch goal if time permits |
+| LARS optimizer | Designed for batch ≥ 4096. Layer-wise trust ratio adds noise at batch 256 | If scaling to multi-node compute |
+| Gradient accumulation for batch >256 | Breaks BT batch statistics (final BN and C matrix computed on smaller-than-intended subsets per step) | Never for BT |
 | RandomHorizontalFlip in augmentation | Flips left/right hand → destroys class identity (texting-left vs texting-right) | Never on this dataset |
 | Random train/val split | Subject leakage massively inflates val acc vs LB | Never on this dataset |

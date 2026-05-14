@@ -81,7 +81,7 @@ def sample_alignment_uniformity(
     device: torch.device,
     max_batches: int = 5,
 ) -> Dict[str, float]:
-    """Estimate align/uniform from a few pretrain batches."""
+    """Estimate align/uniform from a few pretrain batches (SimCLR diagnostic)."""
     from .loss import alignment_uniformity
 
     simclr_model.eval()
@@ -100,4 +100,38 @@ def sample_alignment_uniformity(
     return {
         "alignment": float(np.mean(aligns)),
         "uniformity": float(np.mean(uniforms)),
+    }
+
+
+@torch.no_grad()
+def sample_cross_correlation(
+    bt_model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int = 5,
+) -> Dict[str, float]:
+    """Estimate Barlow Twins cross-correlation stats from a few pretrain batches.
+
+    Returns mean of ``diag(C)`` and rms of off-diagonal entries.
+    Healthy: ``c_diag_mean`` -> 1.0, ``c_offdiag_rms`` -> 0.05-0.1.
+    Collapse: ``c_diag_mean`` stuck below ~0.3 by epoch 20.
+    """
+    from .loss import cross_correlation_stats
+
+    bt_model.eval()
+    diags, offs = [], []
+    for i, (v1, v2) in enumerate(loader):
+        if i >= max_batches:
+            break
+        v1 = v1.to(device, non_blocking=True)
+        v2 = v2.to(device, non_blocking=True)
+        z1 = bt_model(v1)
+        z2 = bt_model(v2)
+        stats = cross_correlation_stats(z1, z2)
+        diags.append(stats["c_diag_mean"])
+        offs.append(stats["c_offdiag_rms"])
+
+    return {
+        "c_diag_mean": float(np.mean(diags)),
+        "c_offdiag_rms": float(np.mean(offs)),
     }

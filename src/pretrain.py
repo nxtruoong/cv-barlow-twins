@@ -1,4 +1,20 @@
-"""SimCLR pretraining loop. Single-GPU or DDP (launched via torchrun)."""
+"""Barlow Twins pretraining loop. Single-GPU or DDP on CUDA (T4 x2).
+
+Phase 1 SSL method per ADR-0003 (Barlow Twins replaces SimCLR). The TPU/XLA
+path used by the prior SimCLR plan lives on the ``tpu-v5e-8-snapshot``
+branch and is no longer wired here.
+
+Key requirements for correctness:
+
+1. ``nn.SyncBatchNorm.convert_sync_batchnorm`` BEFORE wrapping in DDP, so
+   the final ``BatchNorm1d(affine=False)`` in the projector reflects the
+   global batch. Local-batch BN silently undertrains.
+2. Single concatenated forward per step with per-view BN inside
+   ``BarlowTwinsModel.forward(v1, v2)`` — avoids DDP multiple-forward
+   autograd quirks observed previously with SimCLR.
+3. C matrix summed across ranks via ``dist.all_reduce`` inside
+   ``BarlowTwinsLoss`` so the loss reflects the global cross-correlation.
+"""
 import argparse
 import json
 import os
@@ -17,24 +33,27 @@ from tqdm import tqdm
 from .augmentation import build_pretrain_transform, ContrastiveViewGenerator, \
     build_pretrain_eval_transform
 from .config import (
-    PRETRAIN_BATCH_SIZE, PRETRAIN_EPOCHS, PRETRAIN_WARMUP_EPOCHS,
-    PRETRAIN_LR, PRETRAIN_WEIGHT_DECAY, get_working_dir,
+    BT_BATCH_SIZE, BT_EPOCHS, BT_WARMUP_EPOCHS, BT_LR, BT_WEIGHT_DECAY,
+    get_working_dir,
 )
 from .data import (
     UnlabeledImageDataset, LabeledImageDataset, list_train_images,
     list_test_images, load_driver_table, build_group_kfold, make_loader,
 )
-from .diagnostics import linear_probe, sample_alignment_uniformity
-from .loss import NTXentLoss
-from .model import SimCLRModel
+from .diagnostics import linear_probe
+from .loss import BarlowTwinsLoss, cross_correlation_stats
+from .model import BarlowTwinsModel
 from .seed_utils import set_seed
 
 
+# Epochs at which to run the (expensive) linear probe. Lightweight C-matrix
+# stats are logged every epoch.
+LINEAR_PROBE_EPOCHS = {20, 40, 60, 80}
+
+
 def _unwrap(m: nn.Module) -> nn.Module:
-    """Strip DDP and torch.compile wrappers to access underlying module."""
-    m = getattr(m, "module", m)  # DDP
-    m = getattr(m, "_orig_mod", m)  # torch.compile
-    return m
+    """Strip DDP wrapper to access underlying module."""
+    return getattr(m, "module", m)
 
 
 def setup_distributed() -> tuple:
@@ -64,9 +83,9 @@ def save_checkpoint(model: nn.Module, optimizer, scheduler, epoch: int,
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "history": history,
     }
-    path = out_dir / f"simclr_resnet18_ep{epoch:03d}.pth"
+    path = out_dir / f"bt_resnet18_ep{epoch:03d}.pth"
     torch.save(state, path)
-    latest = out_dir / "simclr_resnet18_latest.pth"
+    latest = out_dir / "bt_resnet18_latest.pth"
     torch.save(state, latest)
 
 
@@ -95,8 +114,6 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
 
 def run_pretrain(args) -> None:
     set_seed()
-    # Override determinism for pretrain throughput. SimCLR pretrain is
-    # non-critical for exact reproducibility; fine-tune still seeded.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
     rank, world_size, local_rank = setup_distributed()
@@ -122,25 +139,22 @@ def run_pretrain(args) -> None:
         num_workers=args.num_workers, drop_last=True, sampler=sampler,
     )
 
-    model = SimCLRModel(pretrained_backbone=False).to(device)
+    model = BarlowTwinsModel(pretrained_backbone=False).to(device)
     model = model.to(memory_format=torch.channels_last)
-    if not args.no_compile:
-        # torch.compile BEFORE DDP wrap. mode="reduce-overhead" enables CUDA
-        # graphs (skip kernel-launch overhead) — best fit for T4 (40 SMs, below
-        # the 68-SM threshold for max_autotune_gemm). drop_last=True keeps
-        # shape stable so graphs don't recapture.
-        model = torch.compile(model, mode="reduce-overhead")
     if world_size > 1:
+        # SyncBN BEFORE DDP wrap. Without this the final
+        # BatchNorm1d(affine=False) uses per-GPU stats -> per-GPU C matrix.
+        model = BarlowTwinsModel.convert_sync_bn(model)
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=False)
 
-    loss_fn = NTXentLoss(gather_distributed=(world_size > 1))
+    loss_fn = BarlowTwinsLoss(lambda_off=args.lambda_off)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=PRETRAIN_WEIGHT_DECAY,
+        model.parameters(), lr=args.lr, weight_decay=BT_WEIGHT_DECAY,
     )
     scheduler = CosineLRScheduler(
-        optimizer, t_initial=args.epochs, warmup_t=PRETRAIN_WARMUP_EPOCHS,
+        optimizer, t_initial=args.epochs, warmup_t=BT_WARMUP_EPOCHS,
         warmup_lr_init=1e-6, lr_min=0.0,
     )
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -158,7 +172,7 @@ def run_pretrain(args) -> None:
         if is_main(rank):
             print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
-    out_dir = Path(args.output_dir) if args.output_dir else get_working_dir() / "simclr"
+    out_dir = Path(args.output_dir) if args.output_dir else get_working_dir() / "bt"
 
     for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
@@ -168,17 +182,14 @@ def run_pretrain(args) -> None:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
-        # Async loss accumulator (stays on GPU until epoch end -> no per-step sync)
         loss_accum = torch.zeros((), device=device)
-        # Diagnostics sampled every DIAG_EVERY steps; ~5% sync overhead
         DIAG_EVERY = 20
         n_batches = 0
         diag_count = 0
         t_data_sum = 0.0
         t_compute_sum = 0.0
-        pos_sum = 0.0
-        neg_sum = 0.0
-        std_sum = 0.0
+        diag_mean_sum = 0.0
+        off_rms_sum = 0.0
         images_seen = 0
         epoch_t0 = time.time()
         pbar = tqdm(loader, disable=not is_main(rank), desc=f"epoch {epoch}")
@@ -188,13 +199,8 @@ def run_pretrain(args) -> None:
             v1 = v1.to(device, non_blocking=True, memory_format=torch.channels_last)
             v2 = v2.to(device, non_blocking=True, memory_format=torch.channels_last)
 
-            # Concat views into single forward pass. Two separate forwards
-            # through a DDP-wrapped model corrupts autograd version counters
-            # ("variable modified by inplace op" error). Also faster.
             with autocast("cuda", enabled=args.amp):
-                v = torch.cat([v1, v2], dim=0)
-                z = model(v)
-                z1, z2 = z.chunk(2, dim=0)
+                z1, z2 = model(v1, v2)
                 loss = loss_fn(z1, z2)
 
             optimizer.zero_grad(set_to_none=True)
@@ -202,34 +208,24 @@ def run_pretrain(args) -> None:
             scaler.step(optimizer)
             scaler.update()
 
-            # GPU-side accumulation. No .item() in hot loop -> no CPU<->GPU sync,
-            # async kernel queue stays full.
             loss_accum += loss.detach()
             n_batches += 1
-            images_seen += v.size(0)
+            images_seen += v1.size(0) * 2
             t_compute = time.time() - t_iter - t_data
             t_data_sum += t_data
             t_compute_sum += t_compute
 
-            # Sampled diagnostics: one sync per DIAG_EVERY steps.
             if n_batches % DIAG_EVERY == 0:
                 with torch.no_grad():
-                    pos_t = (z1 * z2).sum(dim=1).mean()
-                    B = z1.size(0)
-                    sim_mat = z1 @ z2.t()
-                    neg_mask = ~torch.eye(B, dtype=torch.bool, device=z.device)
-                    neg_t = sim_mat[neg_mask].mean()
-                    std_t = torch.cat([z1, z2], dim=0).std(dim=0).mean()
-                pos_sum += pos_t.item()
-                neg_sum += neg_t.item()
-                std_sum += std_t.item()
+                    stats = cross_correlation_stats(z1, z2)
+                diag_mean_sum += stats["c_diag_mean"]
+                off_rms_sum += stats["c_offdiag_rms"]
                 diag_count += 1
                 if is_main(rank):
                     pbar.set_postfix(
                         loss=(loss_accum / n_batches).item(),
-                        pos=pos_sum / diag_count,
-                        neg=neg_sum / diag_count,
-                        std=std_sum / diag_count,
+                        diag=diag_mean_sum / diag_count,
+                        off=off_rms_sum / diag_count,
                     )
             t_iter = time.time()
 
@@ -246,7 +242,6 @@ def run_pretrain(args) -> None:
         if is_main(rank):
             print(f"[ep {epoch}] avg data={t_data_sum/max(n_batches,1):.3f}s "
                   f"compute={t_compute_sum/max(n_batches,1):.3f}s "
-                  f"-> {'IO-bound' if t_data_sum > t_compute_sum else 'compute-bound'} "
                   f"| {throughput:.0f} img/s | {epoch_sec/60:.1f} min "
                   f"| peak_mem={gpu_mem_peak_gb:.2f} GB | lr={current_lr:.2e}")
 
@@ -254,9 +249,8 @@ def run_pretrain(args) -> None:
         log_entry = {
             "epoch": epoch,
             "loss": epoch_loss,
-            "pos_sim": pos_sum / max(diag_count, 1),
-            "neg_sim": neg_sum / max(diag_count, 1),
-            "embed_std": std_sum / max(diag_count, 1),
+            "c_diag_mean": diag_mean_sum / max(diag_count, 1),
+            "c_offdiag_rms": off_rms_sum / max(diag_count, 1),
             "lr": current_lr,
             "throughput_img_s": throughput,
             "epoch_sec": epoch_sec,
@@ -265,18 +259,19 @@ def run_pretrain(args) -> None:
             "t_compute_avg": t_compute_sum / max(n_batches, 1),
         }
 
-        if is_main(rank) and (epoch + 1) % args.diagnostic_every == 0:
+        # Linear probe at pre-registered epochs only — too expensive to run
+        # every 10. C-matrix stats above already gate against silent collapse.
+        if is_main(rank) and (epoch + 1) in LINEAR_PROBE_EPOCHS:
             base = _unwrap(model)
             base.eval()
-            au = sample_alignment_uniformity(base, loader, device, max_batches=3)
             probe_train, probe_val = build_probe_loaders(
                 batch_size=256, num_workers=args.num_workers,
             )
             probe = linear_probe(base.backbone, probe_train, probe_val, device)
-            log_entry.update(au)
             log_entry.update(probe)
             print(f"[ep {epoch}] loss={epoch_loss:.4f} "
-                  f"align={au['alignment']:.4f} uniform={au['uniformity']:.4f} "
+                  f"diag={log_entry['c_diag_mean']:.3f} "
+                  f"off_rms={log_entry['c_offdiag_rms']:.3f} "
                   f"probe_acc={probe['linear_probe_acc']:.4f} "
                   f"probe_ll={probe['linear_probe_log_loss']:.4f}")
 
@@ -293,10 +288,7 @@ def run_pretrain(args) -> None:
 
 
 def ddp_worker(rank: int, world_size: int, args) -> None:
-    """DDP entry for torch.multiprocessing.spawn (notebook-friendly).
-
-    Must live at module level so spawn child processes can import it by name.
-    """
+    """DDP entry for torch.multiprocessing.spawn (Kaggle notebook-friendly)."""
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_RANK"] = str(rank)
@@ -306,16 +298,15 @@ def ddp_worker(rank: int, world_size: int, args) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    from .config import BT_LAMBDA
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
-    p.add_argument("--batch-size", type=int, default=PRETRAIN_BATCH_SIZE)
-    p.add_argument("--lr", type=float, default=PRETRAIN_LR)
-    p.add_argument("--num-workers", type=int, default=12)
+    p.add_argument("--epochs", type=int, default=BT_EPOCHS)
+    p.add_argument("--batch-size", type=int, default=BT_BATCH_SIZE)
+    p.add_argument("--lr", type=float, default=BT_LR)
+    p.add_argument("--lambda-off", type=float, default=BT_LAMBDA)
+    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--amp", action="store_true", default=True)
-    p.add_argument("--no-compile", action="store_true", default=False,
-                   help="disable torch.compile (debug only)")
     p.add_argument("--save-every", type=int, default=10)
-    p.add_argument("--diagnostic-every", type=int, default=10)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--output-dir", type=str, default=None)
     return p.parse_args()

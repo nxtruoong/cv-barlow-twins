@@ -13,7 +13,7 @@ from src.finetune import run_finetune
 from src.submit import run_submit
 
 WINNER_CONDITION = "C_imagenet"  # set after viewing headline results
-SIMCLR_CKPT = "/kaggle/input/simclr-pretrain-final/simclr_resnet18_ep099.pth"
+BT_CKPT = "/kaggle/input/bt-pretrain-final/bt_resnet18_ep079.pth"
 OUTPUT_DIR = "/kaggle/working/finetune_kfold"
 
 
@@ -21,7 +21,8 @@ def make_args(fold: int):
     return argparse.Namespace(
         condition=WINNER_CONDITION,
         fold=fold,
-        simclr_ckpt=SIMCLR_CKPT if WINNER_CONDITION == "B_simclr" else None,
+        ssl_ckpt=BT_CKPT if WINNER_CONDITION == "B_bt" else None,
+        simclr_ckpt=None,  # legacy alias; unused
         batch_size=128,
         num_workers=4,
         amp=True,
