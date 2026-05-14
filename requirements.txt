@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision>=0.15.0
+lightly>=1.5.0
+timm>=0.9.0
+numpy
+pandas
+scikit-learn
+pillow
+matplotlib
+tqdm
+grad-cam>=1.5.0

@@ -1,0 +1,40 @@
+# Claude artifacts
+.claude.json
+.claude/
+CLAUDE.md
+CONTEXT.md
+docs/agents/
+docs/adr/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Outputs / artifacts
+outputs/
+data/
+*.pth
+*.ckpt
+*.npy
+*.log
+submission*.csv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
