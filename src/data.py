@@ -9,8 +9,17 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupKFold
 
-from .config import SEED, N_FOLDS, get_data_root
+from .config import SEED, N_FOLDS, PRETRAIN_IMG_SIZE, get_data_root
 from .seed_utils import make_generator, worker_init_fn
+
+
+def _fast_jpeg_open(path: str, draft_size: int) -> Image.Image:
+    """JPEG decode at reduced DCT scale via libjpeg draft mode. 2-4x faster
+    than full decode when target res << source res. Must be called before
+    any pixel access (load/convert)."""
+    img = Image.open(path)
+    img.draft("RGB", (draft_size, draft_size))
+    return img.convert("RGB")
 
 
 def load_driver_table(data_root: Optional[Path] = None) -> pd.DataFrame:
@@ -60,7 +69,8 @@ class UnlabeledImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, idx: int):
-        img = Image.open(self.paths[idx]).convert("RGB")
+        # 2x draft target: RandomResizedCrop scale_min=0.5 -> need 2x crop size
+        img = _fast_jpeg_open(self.paths[idx], PRETRAIN_IMG_SIZE * 2)
         return self.view_generator(img)
 
 

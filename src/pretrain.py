@@ -315,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
     p.add_argument("--batch-size", type=int, default=PRETRAIN_BATCH_SIZE)
     p.add_argument("--lr", type=float, default=PRETRAIN_LR)
-    p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--num-workers", type=int, default=12)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--diagnostic-every", type=int, default=10)
