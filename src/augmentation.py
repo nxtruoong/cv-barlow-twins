@@ -15,11 +15,14 @@ from .config import IMG_SIZE, PRETRAIN_IMG_SIZE, IMAGENET_MEAN, IMAGENET_STD
 
 
 def build_pretrain_transform() -> v2.Compose:
-    """SimCLR augmentation in tensor space (v2). Input: uint8 CHW tensor.
+    """SimCLR augmentation in tensor space (v2). Accepts uint8 CHW tensor OR PIL.
 
     Output: float32 CHW tensor, normalized. Kernel=23 is ~10% of 224 — paper default.
+    `v2.ToImage()` upfront makes the pipeline work for both the TPU memmap path
+    (already CHW uint8) and the legacy CUDA path (PIL via `_fast_jpeg_open`).
     """
     return v2.Compose([
+        v2.ToImage(),  # no-op for tensors; PIL -> uint8 CHW tensor
         v2.RandomResizedCrop(PRETRAIN_IMG_SIZE, scale=(0.5, 1.0), antialias=True),
         v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
         v2.RandomGrayscale(p=0.2),
