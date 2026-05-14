@@ -88,6 +88,10 @@ def build_probe_loaders(batch_size: int, num_workers: int) -> tuple:
 
 def run_pretrain(args) -> None:
     set_seed()
+    # Override determinism for pretrain throughput. SimCLR pretrain is
+    # non-critical for exact reproducibility; fine-tune still seeded.
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
@@ -112,6 +116,7 @@ def run_pretrain(args) -> None:
     )
 
     model = SimCLRModel(pretrained_backbone=False).to(device)
+    model = model.to(memory_format=torch.channels_last)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=False)
@@ -166,8 +171,8 @@ def run_pretrain(args) -> None:
         t_iter = time.time()
         for v1, v2 in pbar:
             t_data = time.time() - t_iter
-            v1 = v1.to(device, non_blocking=True)
-            v2 = v2.to(device, non_blocking=True)
+            v1 = v1.to(device, non_blocking=True, memory_format=torch.channels_last)
+            v2 = v2.to(device, non_blocking=True, memory_format=torch.channels_last)
 
             # Concat views into single forward pass. Two separate forwards
             # through a DDP-wrapped model corrupts autograd version counters
@@ -179,7 +184,15 @@ def run_pretrain(args) -> None:
                 loss = loss_fn(z1, z2)
 
             if not amp_verified and is_main(rank):
-                print(f"[amp check] z.dtype={z.dtype} (expect float16 if amp on)")
+                # AMP verify via inline backbone probe (under autocast).
+                # Model's final op is F.normalize which promotes to fp32 by
+                # autocast policy — that's expected. Check backbone interior.
+                base = model.module if hasattr(model, "module") else model
+                with torch.no_grad(), autocast("cuda", enabled=args.amp):
+                    probe_h = base.backbone(v[:2])
+                print(f"[amp check] backbone_dtype={probe_h.dtype} "
+                      f"normalized_z_dtype={z.dtype} "
+                      f"(fp16 backbone + fp32 normalize = AMP working)")
                 amp_verified = True
 
             # Collapse / quality stats. z already L2-normalized by SimCLRModel.
@@ -302,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
     p.add_argument("--batch-size", type=int, default=PRETRAIN_BATCH_SIZE)
     p.add_argument("--lr", type=float, default=PRETRAIN_LR)
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--amp", action="store_true", default=True)
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--diagnostic-every", type=int, default=10)

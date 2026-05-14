@@ -103,9 +103,10 @@ def make_loader(
     num_workers: int = 4,
     drop_last: bool = False,
     sampler=None,
+    prefetch_factor: int = 4,
 ) -> DataLoader:
-    return DataLoader(
-        dataset,
+    kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle and sampler is None,
         num_workers=num_workers,
@@ -116,3 +117,6 @@ def make_loader(
         sampler=sampler,
         persistent_workers=num_workers > 0,
     )
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(**kwargs)
