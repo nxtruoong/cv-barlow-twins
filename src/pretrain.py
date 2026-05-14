@@ -200,8 +200,9 @@ def run_pretrain(args) -> None:
             scaler.step(optimizer)
             scaler.update()
 
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            # No per-step cuda.synchronize: kills kernel-launch overlap.
+            # t_compute is kernel-queue time (approximate). Wallclock
+            # throughput at epoch end uses one final sync and is accurate.
             t_compute = time.time() - t_iter - t_data
             t_data_sum += t_data
             t_compute_sum += t_compute
@@ -223,6 +224,8 @@ def run_pretrain(args) -> None:
                 )
             t_iter = time.time()
 
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         epoch_sec = time.time() - epoch_t0
         throughput = images_seen / max(epoch_sec, 1e-6)
         gpu_mem_peak_gb = (
