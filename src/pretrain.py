@@ -200,6 +200,19 @@ def run_pretrain(args) -> None:
         dist.destroy_process_group()
 
 
+def ddp_worker(rank: int, world_size: int, args) -> None:
+    """DDP entry for torch.multiprocessing.spawn (notebook-friendly).
+
+    Must live at module level so spawn child processes can import it by name.
+    """
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    run_pretrain(args)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=PRETRAIN_EPOCHS)
